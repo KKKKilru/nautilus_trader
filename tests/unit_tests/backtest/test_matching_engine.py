@@ -14,6 +14,7 @@
 # -------------------------------------------------------------------------------------------------
 
 import contextlib
+import inspect
 from decimal import Decimal
 from typing import Any
 
@@ -25,6 +26,7 @@ from nautilus_trader.backtest.models import FillModel
 from nautilus_trader.backtest.models import MakerTakerFeeModel
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.component import TestClock
+from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.engine import ExecutionEngine
 from nautilus_trader.execution.messages import ModifyOrder
@@ -52,6 +54,7 @@ from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderCanceled
 from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.events import OrderInitialized
 from nautilus_trader.model.events import OrderModifyRejected
 from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.events import OrderUpdated
@@ -11370,3 +11373,321 @@ class TestOrderMatchingEngineQuoteQuantity:
         assert len(updates) == 0
         assert len(fills) == 1
         assert order.is_quote_quantity is True
+
+
+# -------------------------------------------------------------------------------------------------
+# Spec 145 P1 T6: regression tests for `fill_price_override` (deterministic MARKET fill).
+#
+# Source commits under test:
+#   - b7f1f4edd1 — Order.fill_price_override field + msgspec exclusion
+#   - dc8bfb429b — Factory + MarketOrder wiring
+#   - ef15357aae — Engine short-circuit in determine_market_fills_with_simulation
+#
+# Design invariants enforced (spec 145 design doc):
+#   #3 — `fill_price_override` MUST NOT serialize via to_dict_c / MUST be dropped by from_dict_c
+#        (prevents Redis stream / WebSocket / historical-artifact replay injection).
+#   #4 — Engine performs NO range validation — strategy is contract-responsible.
+# -------------------------------------------------------------------------------------------------
+
+
+def _create_bar_execution_matching_engine_for_override() -> tuple[
+    OrderMatchingEngine,
+    MessageBus,
+    Any,  # cache
+    Any,  # account_id
+    Any,  # instrument
+]:
+    """
+    Build a bar-execution matching engine identical to the one used by the
+    existing trade-id-counter and MIT regression tests. Returned bundle is
+    everything spec-145 fill-override tests need to drive a bar+order cycle.
+
+    """
+    clock = TestClock()
+    trader_id = TestIdStubs.trader_id()
+    msgbus = MessageBus(trader_id=trader_id, clock=clock)
+    instrument = _ETHUSDT_PERP_BINANCE
+    cache = TestComponentStubs.cache()
+    cache.add_instrument(instrument)
+    account_id = TestIdStubs.account_id()
+
+    matching_engine = OrderMatchingEngine(
+        instrument=instrument,
+        raw_id=0,
+        fill_model=FillModel(),
+        fee_model=MakerTakerFeeModel(),
+        book_type=BookType.L1_MBP,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        reject_stop_orders=False,
+        bar_execution=True,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+    )
+    return matching_engine, msgbus, cache, account_id, instrument
+
+
+def _make_override_test_bar(instrument) -> Bar:
+    """
+    Canonical bar for spec-145 fill-override tests: O=100, H=110, L=90, C=105.
+    Range 90..110 is wide enough to distinguish a 95.00 override from any of
+    the OHLC ticks (none equals 95.00).
+    """
+    bar_spec = BarSpecification(
+        step=1,
+        aggregation=BarAggregation.MINUTE,
+        price_type=PriceType.LAST,
+    )
+    bar_type = BarType(
+        instrument_id=instrument.id,
+        bar_spec=bar_spec,
+        aggregation_source=AggregationSource.EXTERNAL,
+    )
+    return Bar(
+        bar_type=bar_type,
+        open=Price.from_str("100.00"),
+        high=Price.from_str("110.00"),
+        low=Price.from_str("90.00"),
+        close=Price.from_str("105.00"),
+        volume=Quantity.from_str("100.000"),
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+def test_market_fill_at_override_price() -> None:
+    """
+    Canonical happy-path: MARKET BUY with `fill_price_override=Price("95.00")` on a
+    bar with O=100/H=110/L=90/C=105 fills at exactly 95.00 (NOT bar.open / high /
+    low / close). Enforces spec 145 engine short-circuit
+    (`determine_market_fills_with_simulation`).
+    """
+    # Arrange
+    matching_engine, msgbus, _cache, account_id, instrument = (
+        _create_bar_execution_matching_engine_for_override()
+    )
+    bar = _make_override_test_bar(instrument)
+    matching_engine.process_bar(bar)
+
+    messages: list[Any] = []
+    msgbus.register("ExecEngine.process", messages.append)
+
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("95.00"),
+    )
+
+    # Act
+    matching_engine.process_order(order, account_id)
+
+    # Assert: exactly one fill, at the override price (NOT 100/110/90/105).
+    fills = [m for m in messages if isinstance(m, OrderFilled)]
+    assert len(fills) == 1, (
+        f"Expected one fill, got {[type(m).__name__ for m in messages]}"
+    )
+    assert fills[0].last_px == Price.from_str("95.00"), (
+        f"Expected fill at override 95.00, got {fills[0].last_px}"
+    )
+
+
+def test_market_no_override_uses_stock_fill() -> None:
+    """
+    Regression test: with NO `fill_price_override`, the engine MUST fall through
+    to the stock OHLC-tick fill path. The exact stock fill price for a MARKET
+    BUY submitted AFTER a closed bar with O=100/H=110/L=90/C=105 follows the
+    L1_MBP ask state left by the bar's last tick (close=105.00) — this mirrors
+    the existing `test_bar_execution_bumps_trade_id_counter_per_tick`
+    pattern (bar O/H/L/C all 1000.00 → fill at 1000.00).
+
+    The critical contract is `last_px != 95.00` AND fill price is within bar
+    range (90..110); we additionally pin to bar.close to detect regressions in
+    stock behavior.
+    """
+    # Arrange
+    matching_engine, msgbus, _cache, account_id, instrument = (
+        _create_bar_execution_matching_engine_for_override()
+    )
+    bar = _make_override_test_bar(instrument)
+    matching_engine.process_bar(bar)
+
+    messages: list[Any] = []
+    msgbus.register("ExecEngine.process", messages.append)
+
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        # NO fill_price_override — stock OHLC tick path must run.
+    )
+
+    # Act
+    matching_engine.process_order(order, account_id)
+
+    # Assert
+    fills = [m for m in messages if isinstance(m, OrderFilled)]
+    assert len(fills) == 1, (
+        f"Expected one fill, got {[type(m).__name__ for m in messages]}"
+    )
+    last_px = fills[0].last_px
+    # Stock behavior: fill at last tick of the bar (close) for L1_MBP bar exec.
+    assert last_px == Price.from_str("105.00"), (
+        f"Stock-fill regression: expected bar.close=105.00, got {last_px}. "
+        f"The override short-circuit must NOT fire when fill_price_override is None."
+    )
+    # Defensive: the override sentinel value 95.00 must NEVER appear in this path.
+    assert last_px != Price.from_str("95.00")
+
+
+def test_market_fills_at_out_of_range_override() -> None:
+    """
+    Documents NT no-validate behavior per spec 145 design invariant #4 — the
+    backtest engine fills at `fill_price_override` even when it sits WAY outside
+    the bar's OHLC range (e.g. 200.00 vs bar high 110.00). The strategy layer is
+    contract-responsible for range validation in P2 (`_execute_with_fill_price_override`
+    + planner pre-flight). Do NOT take this test as a recommendation to ship
+    out-of-range overrides — it pins the engine's permissive contract so future
+    accidental range-check additions surface as test failures.
+    """
+    # Arrange
+    matching_engine, msgbus, _cache, account_id, instrument = (
+        _create_bar_execution_matching_engine_for_override()
+    )
+    bar = _make_override_test_bar(instrument)  # range 90.00 .. 110.00
+    matching_engine.process_bar(bar)
+
+    messages: list[Any] = []
+    msgbus.register("ExecEngine.process", messages.append)
+
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("200.00"),  # WAY outside [90, 110]
+    )
+
+    # Act
+    matching_engine.process_order(order, account_id)
+
+    # Assert: engine fills at the override unconditionally (no range check).
+    fills = [m for m in messages if isinstance(m, OrderFilled)]
+    assert len(fills) == 1, (
+        f"Expected one fill, got {[type(m).__name__ for m in messages]}"
+    )
+    assert fills[0].last_px == Price.from_str("200.00"), (
+        f"Expected fill at out-of-range override 200.00 (no range validation), "
+        f"got {fills[0].last_px}"
+    )
+
+
+def test_order_serialize_strips_fill_price_override() -> None:
+    """
+    BLOCKING-3 / design invariant #3: `OrderInitialized.to_dict_c` MUST NOT
+    include the key `fill_price_override`. The field is a local-only execution
+    hint consumed by the in-process matching engine. Persisting it would allow
+    external Redis stream / WebSocket / historical-artifact replays to inject
+    overrides.
+    """
+    # Arrange: build a MarketOrder with a non-None override.
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("95.00"),
+    )
+
+    # Sanity: the field IS present on the in-memory order object.
+    assert order.fill_price_override == Price.from_str("95.00")
+
+    # Act: serialize the OrderInitialized event (via both the cpdef Python wrapper
+    # and direct to_dict_c — both code paths must strip the field).
+    init_event = order.init_event
+    py_dict = OrderInitialized.to_dict(init_event)
+
+    # Assert: key is absent from the serialized dict.
+    assert "fill_price_override" not in py_dict, (
+        f"Spec 145 invariant #3 violated: `to_dict` leaks fill_price_override. "
+        f"Keys present: {sorted(py_dict.keys())}"
+    )
+
+
+def test_order_factory_market_accepts_fill_price_override_kwarg() -> None:
+    """
+    Locks the API contract that P2 T2.5 + P4 T3 runtime guards depend on (per
+    R2-Claude SUGGESTION). If `OrderFactory.market` ever loses the
+    `fill_price_override` parameter, downstream callers that pass it would
+    silently TypeError at runtime — this test catches the break at unit-test
+    time.
+    """
+    # Act
+    sig = inspect.signature(OrderFactory.market)
+
+    # Assert
+    assert "fill_price_override" in sig.parameters, (
+        f"OrderFactory.market is missing the `fill_price_override` parameter. "
+        f"Current parameters: {list(sig.parameters.keys())}. "
+        f"Spec 145 P2/P4 runtime guards depend on this API surface."
+    )
+
+
+def test_adversarial_payload_strips_field() -> None:
+    """
+    Codex R2-BLK-2: enforces spec 145 design invariant #3 against external
+    event injection. `to_dict_c` not emitting the field is one half of the
+    closure; `from_dict_c` forcing `None` is the other half. Together they
+    close the round-trip — a malicious payload with an injected
+    `"fill_price_override": "150.00"` key MUST be ignored, not honored.
+    """
+    # Arrange: build a real OrderInitialized event, serialize it, then inject
+    # the adversarial key. This guarantees the dict shape matches the real
+    # from_dict_c schema and only the adversarial key is the variable.
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        # NO fill_price_override on the source order — proves from_dict_c isn't
+        # accidentally reading from the source event.
+    )
+    payload = OrderInitialized.to_dict(order.init_event)
+
+    # Inject the adversarial key (simulates a payload crafted by a third party
+    # or by a poisoned Redis stream / historical artifact).
+    payload["fill_price_override"] = "150.00"
+
+    # Act: deserialize.
+    reconstructed = OrderInitialized.from_dict(payload)
+
+    # Assert: the field is forced to None on deserialization regardless of the
+    # injected value.
+    assert reconstructed.fill_price_override is None, (
+        f"Spec 145 invariant #3 violated: from_dict_c honored injected "
+        f"adversarial fill_price_override = {reconstructed.fill_price_override}. "
+        f"Round-trip closure broken — external injection vector OPEN."
+    )

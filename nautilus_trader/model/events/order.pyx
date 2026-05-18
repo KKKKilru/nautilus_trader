@@ -297,6 +297,7 @@ cdef class OrderInitialized(OrderEvent):
         UUID4 event_id not None,
         uint64_t ts_init,
         bint reconciliation=False,
+        Price fill_price_override: Price | None = None,
     ):
         Condition.not_equal(order_side, OrderSide.NO_ORDER_SIDE, "order_side", "NONE")
         if contingency_type != ContingencyType.NO_CONTINGENCY:
@@ -331,6 +332,10 @@ cdef class OrderInitialized(OrderEvent):
         self.exec_algorithm_params = exec_algorithm_params
         self.exec_spawn_id = exec_spawn_id
         self.tags = tags
+        # Spec 145: deterministic MARKET fill-price override. NOT persisted via
+        # to_dict_c / from_dict_c (msgspec exclusion invariant #3) so external
+        # replay / WebSocket / Redis payloads cannot inject overrides.
+        self.fill_price_override = fill_price_override
 
     def __eq__(self, Event other) -> bool:
         if other is None:
@@ -568,6 +573,11 @@ cdef class OrderInitialized(OrderEvent):
             event_id=UUID4.from_str_c(values["event_id"]),
             ts_init=values["ts_init"],
             reconciliation=values.get("reconciliation", False),
+            # Spec 145 BLOCKING-3 (msgspec exclusion): explicitly force None on
+            # deserialization — do NOT read `fill_price_override` from `values`,
+            # even if a malicious external payload includes the key. Field is a
+            # local-only execution hint, never reconstructed from the wire.
+            fill_price_override=None,
         )
 
     @staticmethod
@@ -602,6 +612,11 @@ cdef class OrderInitialized(OrderEvent):
             "ts_init": obj.ts_init,
             "ts_event": obj.ts_init,
             "reconciliation": obj.reconciliation,
+            # Spec 145 BLOCKING-3 (msgspec exclusion): `fill_price_override` is
+            # intentionally NOT serialized. It is a local-only execution hint
+            # consumed by the in-process matching engine. Persisting it would
+            # allow external Redis stream / WebSocket / historical-artifact
+            # replays to inject overrides — `from_dict_c` also forces None.
         }
 
     @staticmethod

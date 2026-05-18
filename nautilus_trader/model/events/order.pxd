@@ -95,6 +95,8 @@ cdef class OrderInitialized(OrderEvent):
     """The execution algorithm spawning client order ID.\n\n:returns: `ClientOrderId` or ``None``"""
     cdef readonly list[str] tags
     """The order custom user tags.\n\n:returns: `list[str]` or ``None``"""
+    cdef readonly Price fill_price_override
+    """The deterministic fill-price override (spec 145).\n\n:returns: `Price` or ``None``"""
 
     @staticmethod
     cdef OrderInitialized from_dict_c(dict values)

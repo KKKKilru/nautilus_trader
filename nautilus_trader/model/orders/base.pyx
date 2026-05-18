@@ -193,6 +193,7 @@ cdef class Order:
         )
         self._previous_status = OrderStatus.INITIALIZED
         self._triggered_price = None  # Can be None
+        self._fill_price_override = init.fill_price_override  # Can be None (spec 145 deterministic MARKET fill)
 
         # Identifiers
         self.trader_id = init.trader_id
@@ -391,6 +392,12 @@ cdef class Order:
 
     cdef bint has_trigger_price_c(self):
         raise NotImplementedError("method `has_trigger_price_c` must be implemented in subclass")  # pragma: no cover
+
+    cdef bint has_fill_price_override_c(self):
+        # Spec 145: concrete (not abstract) — `fill_price_override` has uniform
+        # semantics across order types (set or not), so the check is independent
+        # of order_type. MARKET-only usage is enforced at the factory layer.
+        return self._fill_price_override is not None
 
     cdef bint is_buy_c(self):
         return self.side == OrderSide.BUY
@@ -621,6 +628,37 @@ cdef class Order:
 
         """
         return self.has_trigger_price_c()
+
+    @property
+    def fill_price_override(self):
+        """
+        Return the deterministic fill-price override for this order, if set.
+
+        Spec 145: when set on a MARKET order, the backtest matching engine
+        will fill at exactly this price (bypassing OHLC tick simulation). The
+        strategy is contract-responsible for validating the price against the
+        bar range — NT does NOT validate. Field is excluded from serialization
+        (`to_dict_c` omits it, `from_dict_c` forces ``None``) to prevent
+        external replay / WebSocket / Redis payloads from injecting overrides.
+
+        Returns
+        -------
+        Price or ``None``
+
+        """
+        return self._fill_price_override
+
+    @property
+    def has_fill_price_override(self):
+        """
+        Return whether the order has a `fill_price_override` set.
+
+        Returns
+        -------
+        bool
+
+        """
+        return self.has_fill_price_override_c()
 
     @property
     def has_activation_price(self):

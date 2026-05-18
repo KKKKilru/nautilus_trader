@@ -65,6 +65,7 @@ cdef class Order:
     cdef FiniteStateMachine _fsm
     cdef OrderStatus _previous_status
     cdef Price _triggered_price
+    cdef Price _fill_price_override
 
     cdef readonly TraderId trader_id
     """The trader ID associated with the position.\n\n:returns: `TraderId`"""
@@ -166,6 +167,7 @@ cdef class Order:
     cdef bint has_price_c(self)
     cdef bint has_activation_price_c(self)
     cdef bint has_trigger_price_c(self)
+    cdef bint has_fill_price_override_c(self)
     cdef bint is_buy_c(self)
     cdef bint is_sell_c(self)
     cdef bint is_passive_c(self)

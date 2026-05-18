@@ -6115,14 +6115,23 @@ cdef class OrderMatchingEngine:
         order.liquidity_side = LiquiditySide.TAKER
         cdef list[tuple[Price, Quantity]] fills = self.determine_market_fills_with_simulation(order)
 
-        # Spec 145 (R1-P1-2): when a deterministic fill-price override is set, the
+        # Spec 145 invariant #4: when a deterministic fill-price override is set, the
         # strategy is contract-responsible for choosing the fill price and we must
-        # fill at exactly that price unconditionally (Decision invariant #4). The
-        # override price typically does NOT exist in the L1/L2 book, so running
-        # the result through `_filter_fills_by_protection` or
-        # `_apply_liquidity_consumption` would silently drop/truncate the fill.
-        # Mirror the `is_trigger_price_fill` exemption pattern below.
-        cdef bint has_override = order.has_fill_price_override_c()
+        # fill at exactly that price unconditionally. The override price typically
+        # does NOT exist in the L1/L2 book, so running the result through
+        # `_filter_fills_by_protection` or `_apply_liquidity_consumption` would
+        # silently drop/truncate the fill. Mirror the `is_trigger_price_fill`
+        # exemption pattern below.
+        #
+        # Spec 145 invariant #2 (belt-and-suspenders): the override is a MARKET-only
+        # feature. The data-model layer (OrderInitialized.__init__) already makes it
+        # impossible to construct a non-MARKET order carrying an override, but gate
+        # on `order_type == OrderType.MARKET` here too so the engine never
+        # short-circuits a non-MARKET order even if one somehow carried the field.
+        cdef bint has_override = (
+            order.has_fill_price_override_c()
+            and order.order_type == OrderType.MARKET
+        )
 
         # Compute protection price at fill time (trigger-time semantics for stops)
         cdef Price protection_price = None
@@ -6168,13 +6177,17 @@ cdef class OrderMatchingEngine:
         for fill simulation. If so, it uses that for fill determination. Otherwise,
         it falls back to the standard market fill logic.
         """
-        # Spec 145: deterministic MARKET fill-price override short-circuit. When the
-        # strategy supplies `fill_price_override`, fill the order's leaves at exactly
-        # that price — no OHLC tick simulation, no FillModel, no range validation
-        # (Decision invariant #4: strategy is contract-responsible for validation).
-        # R1-P1-4: use `get_fill_price_override_c()` cdef accessor (mirrors
-        # `get_triggered_price_c()` pattern) instead of the Python @property.
-        if order.has_fill_price_override_c():
+        # Spec 145 invariant #4: deterministic MARKET fill-price override short-circuit.
+        # When the strategy supplies `fill_price_override`, fill the order's leaves at
+        # exactly that price — no OHLC tick simulation, no FillModel, no range
+        # validation (strategy is contract-responsible for validation). Uses the
+        # `get_fill_price_override_c()` cdef accessor (mirrors `get_triggered_price_c()`)
+        # instead of the Python @property.
+        #
+        # Spec 145 invariant #2: gate on `order_type == OrderType.MARKET` so a
+        # non-MARKET order can never reach the short-circuit even if it somehow
+        # carried an override (the data-model layer already prevents construction).
+        if order.has_fill_price_override_c() and order.order_type == OrderType.MARKET:
             return [(order.get_fill_price_override_c(), order.leaves_qty)]
 
         if self._fill_model is None:

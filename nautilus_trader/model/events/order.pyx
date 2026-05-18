@@ -329,6 +329,14 @@ cdef class OrderInitialized(OrderEvent):
             Condition.is_true(linked_order_ids, f"`linked_order_ids` was `None` or empty when `contingency_type` {contingency_type_to_str(contingency_type)}")
         if exec_algorithm_id is not None:
             Condition.not_none(exec_spawn_id, "exec_spawn_id")
+        # Spec 145 invariant #2: the deterministic fill-price override is a
+        # MARKET-only feature. Enforce at the data-model layer so it is
+        # IMPOSSIBLE to construct an OrderInitialized carrying an override on a
+        # non-MARKET type (triggered STOP_MARKET, MARKET_IF_TOUCHED, etc.) —
+        # any such order would otherwise skip the engine protection /
+        # liquidity filters at trigger-fill.
+        if fill_price_override is not None:
+            Condition.equal(order_type, OrderType.MARKET, "order_type", "OrderType.MARKET")
 
         self._trader_id = trader_id
         self._strategy_id = strategy_id

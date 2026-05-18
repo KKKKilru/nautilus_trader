@@ -399,6 +399,13 @@ cdef class Order:
         # of order_type. MARKET-only usage is enforced at the factory layer.
         return self._fill_price_override is not None
 
+    cdef Price get_fill_price_override_c(self):
+        # Spec 145 (R1-P1-4): cdef accessor for matching-engine hot path.
+        # Mirrors `get_triggered_price_c()` pattern — avoids Python @property
+        # lookup overhead from the backtest fill loop. The Python @property
+        # remains the public surface for tests + serialization.
+        return self._fill_price_override
+
     cdef bint is_buy_c(self):
         return self.side == OrderSide.BUY
 

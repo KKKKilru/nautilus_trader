@@ -168,6 +168,7 @@ cdef class Order:
     cdef bint has_activation_price_c(self)
     cdef bint has_trigger_price_c(self)
     cdef bint has_fill_price_override_c(self)
+    cdef Price get_fill_price_override_c(self)
     cdef bint is_buy_c(self)
     cdef bint is_sell_c(self)
     cdef bint is_passive_c(self)

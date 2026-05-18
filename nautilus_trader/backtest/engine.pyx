@@ -6162,8 +6162,10 @@ cdef class OrderMatchingEngine:
         # strategy supplies `fill_price_override`, fill the order's leaves at exactly
         # that price — no OHLC tick simulation, no FillModel, no range validation
         # (Decision invariant #4: strategy is contract-responsible for validation).
+        # R1-P1-4: use `get_fill_price_override_c()` cdef accessor (mirrors
+        # `get_triggered_price_c()` pattern) instead of the Python @property.
         if order.has_fill_price_override_c():
-            return [(order.fill_price_override, order.leaves_qty)]
+            return [(order.get_fill_price_override_c(), order.leaves_qty)]
 
         if self._fill_model is None:
             return self.determine_market_price_and_volume(order)

@@ -201,6 +201,13 @@ cdef class MarketOrder(Order):
 
     @staticmethod
     cdef MarketOrder from_pyo3_c(pyo3_order):
+        # Spec 145 (R1-P1-6): `fill_price_override` is intentionally NOT
+        # forwarded from the pyo3 order. The field is Cython-side-only and has
+        # no Rust counterpart in NautilusTrader v1.226.0 (the Rust `Order`
+        # struct does not carry it). If a future Rust-side mirror is added,
+        # plumb it through here. For now the override is created via the
+        # MarketOrder Python constructor or OrderFactory.market(), never via
+        # round-trip through pyo3.
         return MarketOrder(
             trader_id=TraderId(str(pyo3_order.trader_id)),
             strategy_id=StrategyId(str(pyo3_order.strategy_id)),
@@ -236,6 +243,14 @@ cdef class MarketOrder(Order):
         dict[str, object]
 
         """
+        # Spec 145 (R1-P1-5): `fill_price_override` is intentionally NOT
+        # serialized (design invariant #3 — see OrderInitialized.to_dict_c /
+        # from_dict_c). The override is a local-only execution hint consumed
+        # by the in-process backtest matching engine. Persisting it would let
+        # external Redis stream / WebSocket / historical-artifact replays
+        # inject overrides. Tests:
+        # `test_order_serialize_strips_fill_price_override` +
+        # `test_adversarial_payload_strips_field`.
         cdef ClientOrderId o
         return {
             "trader_id": self.trader_id.to_str(),
@@ -344,6 +359,13 @@ cdef class MarketOrder(Order):
         """
         Condition.not_none(order, "order")
 
+        # Spec 145 (R1-P1-7): `fill_price_override` is intentionally NOT
+        # carried through `transform()`. The override semantics belong only to
+        # the original MARKET submission path — if a LIMIT/STOP is being
+        # transformed into a MARKET (e.g. emulator promotion), the new MARKET
+        # must follow the engine's stock OHLC tick fill path, not the original
+        # caller's bar-derived override. A fresh override, if needed, must be
+        # supplied explicitly by re-issuing through OrderFactory.market().
         cdef list original_events = order.events_c()
         cdef MarketOrder transformed = MarketOrder(
             trader_id=order.trader_id,

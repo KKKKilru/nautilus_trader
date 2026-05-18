@@ -45,8 +45,10 @@ from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import InstrumentCloseType
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import MarketStatusAction
+from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TrailingOffsetType
@@ -58,7 +60,9 @@ from nautilus_trader.model.events import OrderInitialized
 from nautilus_trader.model.events import OrderModifyRejected
 from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.events import OrderUpdated
+from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import StrategyId
+from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
@@ -11378,12 +11382,11 @@ class TestOrderMatchingEngineQuoteQuantity:
 # -------------------------------------------------------------------------------------------------
 # Spec 145 P1 T6: regression tests for `fill_price_override` (deterministic MARKET fill).
 #
-# Source commits under test:
-#   - b7f1f4edd1 — Order.fill_price_override field + msgspec exclusion
-#   - dc8bfb429b — Factory + MarketOrder wiring
-#   - ef15357aae — Engine short-circuit in determine_market_fills_with_simulation
+# Full design + rationale: docs/superpowers/specs/2026-05-17-145-nt-fork-deterministic-fill-design.md
 #
 # Design invariants enforced (spec 145 design doc):
+#   #2 — `fill_price_override` is a MARKET-only feature — enforced at the data-model
+#        layer (OrderInitialized.__init__), the OrderFactory, and the engine gate.
 #   #3 — `fill_price_override` MUST NOT serialize via to_dict_c / MUST be dropped by from_dict_c
 #        (prevents Redis stream / WebSocket / historical-artifact replay injection).
 #   #4 — Engine performs NO range validation — strategy is contract-responsible.
@@ -11464,9 +11467,9 @@ def test_market_fill_at_override_price(side: OrderSide) -> None:
     low / close). Enforces spec 145 engine short-circuit
     (`determine_market_fills_with_simulation`).
 
-    R1-P1-3 (Claude MAJOR): parametrized BUY+SELL — the short-circuit is
-    side-agnostic and any downstream filter exemption (R1-P1-2) must hold
-    symmetrically. 95.00 is in-range [90, 110] for both sides.
+    Parametrized BUY+SELL — the short-circuit is side-agnostic and the
+    downstream filter exemption must hold symmetrically. 95.00 is in-range
+    [90, 110] for both sides.
     """
     # Arrange
     matching_engine, msgbus, _cache, account_id, instrument = (
@@ -11519,9 +11522,9 @@ def test_market_no_override_uses_stock_fill(side: OrderSide) -> None:
     range (90..110); we additionally pin to bar.close to detect regressions in
     stock behavior.
 
-    R1-P1-3 (Claude MAJOR): parametrized BUY+SELL — the no-override fall-through
-    must NOT introduce a side-specific bug. If a future side branch is added
-    around the short-circuit, this catches asymmetric breakage.
+    Parametrized BUY+SELL — the no-override fall-through must NOT introduce a
+    side-specific bug. If a future side branch is added around the
+    short-circuit, this catches asymmetric breakage.
     """
     # Arrange
     matching_engine, msgbus, _cache, account_id, instrument = (
@@ -11582,10 +11585,10 @@ def test_market_fills_at_out_of_range_override(side: OrderSide, override_px: str
     it pins the engine's permissive contract so future accidental range-check
     additions surface as test failures.
 
-    R1-P1-3 (Claude MAJOR): parametrized BUY/SELL with directional out-of-range
-    overrides (BUY=200 above high, SELL=50 below low). The engine must fill at
-    exactly the override regardless of side — confirms the short-circuit AND
-    the R1-P1-2 filter exemption are both side-agnostic.
+    Parametrized BUY/SELL with directional out-of-range overrides (BUY=200
+    above high, SELL=50 below low). The engine must fill at exactly the
+    override regardless of side — confirms the short-circuit AND the filter
+    exemption are both side-agnostic.
     """
     # Arrange
     matching_engine, msgbus, _cache, account_id, instrument = (
@@ -11626,7 +11629,7 @@ def test_market_fills_at_out_of_range_override(side: OrderSide, override_px: str
 
 def test_order_serialize_strips_fill_price_override() -> None:
     """
-    BLOCKING-3 / design invariant #3: `OrderInitialized.to_dict_c` MUST NOT
+    Spec 145 invariant #3: `OrderInitialized.to_dict_c` MUST NOT
     include the key `fill_price_override`. The field is a local-only execution
     hint consumed by the in-process matching engine. Persisting it would allow
     external Redis stream / WebSocket / historical-artifact replays to inject
@@ -11662,8 +11665,8 @@ def test_order_serialize_strips_fill_price_override() -> None:
 
 def test_order_factory_market_accepts_fill_price_override_kwarg() -> None:
     """
-    Locks the API contract that P2 T2.5 + P4 T3 runtime guards depend on (per
-    R2-Claude SUGGESTION). If `OrderFactory.market` ever loses the
+    Locks the API contract that P2 T2.5 + P4 T3 runtime guards depend on.
+    If `OrderFactory.market` ever loses the
     `fill_price_override` parameter, downstream callers that pass it would
     silently TypeError at runtime — this test catches the break at unit-test
     time.
@@ -11681,7 +11684,7 @@ def test_order_factory_market_accepts_fill_price_override_kwarg() -> None:
 
 def test_adversarial_payload_strips_field() -> None:
     """
-    Codex R2-BLK-2: enforces spec 145 design invariant #3 against external
+    Spec 145 invariant #3: enforces the exclusion against external
     event injection. `to_dict_c` not emitting the field is one half of the
     closure; `from_dict_c` forcing `None` is the other half. Together they
     close the round-trip — a malicious payload with an injected
@@ -11722,9 +11725,9 @@ def test_adversarial_payload_strips_field() -> None:
 
 def test_market_fill_override_skips_liquidity_consumption_and_protection() -> None:
     """
-    Spec 145 P1 R1-P1-2 (MAJOR, Claude): when `fill_price_override` is set, the
-    matching engine MUST fill at exactly the override price unconditionally
-    (design invariant #4). Without an exemption, the downstream filters
+    Spec 145 invariant #4: when `fill_price_override` is set, the
+    matching engine MUST fill at exactly the override price unconditionally.
+    Without an exemption, the downstream filters
     `_filter_fills_by_protection` (gated by `price_protection_points > 0`) and
     `_apply_liquidity_consumption` (gated by `liquidity_consumption=True`)
     would silently drop or truncate the fill because the override price is not
@@ -11809,15 +11812,14 @@ def test_market_fill_override_skips_liquidity_consumption_and_protection() -> No
 
 def test_order_pickle_strips_fill_price_override() -> None:
     """
-    Spec 145 BLOCKING R1-P1-1 (Codex): Cython cdef classes auto-generate
+    Spec 145 invariant #3: Cython cdef classes auto-generate
     serialization for ALL cdef fields including `_fill_price_override` on
     `Order` base. `copy.deepcopy` and `multiprocessing.Queue` both rely on
     the serialization protocol, so the field would leak across these
     boundaries without an explicit scrub.
 
     Tests `Order.__reduce__` enforces `_fill_price_override = None` on the
-    deserialized object — closes the round-trip injection vector for design
-    invariant #3.
+    deserialized object — closes the round-trip injection vector.
     """
     import pickle as _ser  # serialization round-trip module
 
@@ -11844,10 +11846,10 @@ def test_order_pickle_strips_fill_price_override() -> None:
     # Assert — order rebuilds with all other state intact but the override is
     # forced to None.
     assert restored.fill_price_override is None, (
-        f"Spec 145 BLOCKING R1-P1-1 violated: serialization round-trip "
+        f"Spec 145 invariant #3 violated: serialization round-trip "
         f"preserved `fill_price_override` = {restored.fill_price_override!r}. "
         f"copy.deepcopy / multiprocessing.Queue would carry the override "
-        f"across process / debug boundaries (invariant #3 violated)."
+        f"across process / debug boundaries."
     )
     assert restored.has_fill_price_override is False, (
         f"`has_fill_price_override` should reflect scrubbed state, "
@@ -11859,17 +11861,17 @@ def test_order_pickle_strips_fill_price_override() -> None:
     assert restored.quantity == order.quantity
     assert restored.side == order.side
 
-    # R2-P1 (Codex MINOR): the nested OrderInitialized in `_events[0]` must
-    # ALSO be scrubbed — pickle recursion invokes OrderInitialized.__reduce__
-    # for list contents, but the invariant deserves an explicit assertion so a
-    # future Cython list-pickling change can't silently regress it.
+    # Spec 145: the nested OrderInitialized in `_events[0]` must ALSO be
+    # scrubbed — pickle recursion invokes OrderInitialized.__reduce__ for list
+    # contents, but the invariant deserves an explicit assertion so a future
+    # Cython list-pickling change can't silently regress it.
     assert restored.init_event.fill_price_override is None, (
         "nested OrderInitialized must also be scrubbed on round-trip"
     )
 
-    # R2-P1 (Claude MINOR): copy.deepcopy uses __reduce_ex__ → __reduce__, so
-    # the scrub fires for deepcopy too. Pin it explicitly at the deepcopy
-    # integration point (the threat model's primary vector).
+    # Spec 145: copy.deepcopy uses __reduce_ex__ -> __reduce__, so the scrub
+    # fires for deepcopy too. Pin it explicitly at the deepcopy integration
+    # point (the threat model's primary vector).
     import copy as _copy
 
     deep = _copy.deepcopy(order)
@@ -11883,7 +11885,7 @@ def test_order_pickle_strips_fill_price_override() -> None:
 
 def test_order_initialized_pickle_strips_fill_price_override() -> None:
     """
-    Spec 145 BLOCKING R1-P1-1 (Codex): event-level analog of
+    Spec 145 invariant #3: event-level analog of
     `test_order_pickle_strips_fill_price_override`. Cython auto-generated
     serialization preserves `cdef readonly Price fill_price_override` on
     `OrderInitialized`, bypassing the 3-layer dict/Arrow/Rust exclusion.
@@ -11915,7 +11917,7 @@ def test_order_initialized_pickle_strips_fill_price_override() -> None:
 
     # Assert — event reconstructs with override scrubbed.
     assert restored.fill_price_override is None, (
-        f"Spec 145 BLOCKING R1-P1-1 violated at event level: serialization "
+        f"Spec 145 invariant #3 violated at event level: serialization "
         f"round-trip preserved `OrderInitialized.fill_price_override` = "
         f"{restored.fill_price_override!r}. "
         f"3-layer dict/Arrow/Rust exclusion bypassed via serialization."
@@ -11926,3 +11928,286 @@ def test_order_initialized_pickle_strips_fill_price_override() -> None:
     assert restored.id == init_event.id
     assert restored.side == init_event.side
     assert restored.quantity == init_event.quantity
+
+
+def _make_order_initialized(
+    order_type: OrderType,
+    *,
+    fill_price_override: Price | None = None,
+) -> OrderInitialized:
+    """
+    Build an OrderInitialized directly with the given order_type.
+
+    Used by spec 145 F-1 to exercise the data-model MARKET-only guard without
+    routing through a concrete Order subclass (whose constructor would force
+    its own order_type).
+    """
+    return OrderInitialized(
+        trader_id=TraderId("TRADER-001"),
+        strategy_id=StrategyId("S-001"),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=ClientOrderId("O-145-NONMARKET"),
+        order_side=OrderSide.BUY,
+        order_type=order_type,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        time_in_force=TimeInForce.GTC,
+        post_only=False,
+        reduce_only=False,
+        quote_quantity=False,
+        options={},
+        emulation_trigger=TriggerType.NO_TRIGGER,
+        trigger_instrument_id=None,
+        contingency_type=ContingencyType.NO_CONTINGENCY,
+        order_list_id=None,
+        linked_order_ids=None,
+        parent_order_id=None,
+        exec_algorithm_id=None,
+        exec_algorithm_params=None,
+        exec_spawn_id=None,
+        tags=None,
+        event_id=UUID4(),
+        ts_init=0,
+        fill_price_override=fill_price_override,
+    )
+
+
+@pytest.mark.parametrize(
+    "order_type",
+    [OrderType.LIMIT, OrderType.STOP_MARKET, OrderType.MARKET_IF_TOUCHED],
+)
+def test_order_initialized_rejects_override_on_non_market(order_type: OrderType) -> None:
+    """
+    Spec 145 invariant #2 (F-1 BLOCKING): `fill_price_override` is a MARKET-only
+    feature. `OrderInitialized.__init__` must REJECT an override on any
+    non-MARKET order_type via `Condition.equal` — making it impossible to
+    construct a non-MARKET order carrying an override that would otherwise skip
+    the engine protection / liquidity filters at trigger-fill.
+
+    Mirrors the `MarketOrder.from_dict` order-type guard.
+    """
+    # A non-MARKET type WITHOUT an override must still construct fine.
+    ok_event = _make_order_initialized(order_type, fill_price_override=None)
+    assert ok_event.fill_price_override is None
+
+    # A non-MARKET type WITH an override must raise at construction time.
+    with pytest.raises((ValueError, RuntimeError)):
+        _make_order_initialized(
+            order_type,
+            fill_price_override=Price.from_str("95.00"),
+        )
+
+
+def test_order_initialized_accepts_override_on_market() -> None:
+    """
+    Spec 145 invariant #2 (F-1): the F-1 guard must NOT regress the legitimate
+    MARKET path — an override on a MARKET order_type still constructs.
+    """
+    event = _make_order_initialized(
+        OrderType.MARKET,
+        fill_price_override=Price.from_str("95.00"),
+    )
+    assert event.fill_price_override == Price.from_str("95.00")
+
+
+def test_order_reduce_uses_scrub_reconstructor() -> None:
+    """
+    Spec 145 F-2 (MAJOR): `Order.__reduce__` wraps `self.__reduce_cython__()` —
+    a Cython-internal auto-generated symbol, not public API. A future Cython
+    upgrade could rename or reshape it and silently break the pickle scrub.
+
+    This guard asserts `__reduce__` still routes through the module-level
+    `_unpickle_order_scrub_override` reconstructor. If a Cython upgrade changes
+    the reduce shape, this test fails fast instead of silently leaking the
+    override across serialization boundaries.
+    """
+    from nautilus_trader.model.orders.base import _unpickle_order_scrub_override
+
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("95.00"),
+    )
+
+    reduce_tuple = order.__reduce__()
+    assert reduce_tuple[0] is _unpickle_order_scrub_override, (
+        "Order.__reduce__ must route through _unpickle_order_scrub_override. "
+        "If this fails after a Cython upgrade, __reduce_cython__ changed shape "
+        "and the pickle scrub may be broken — investigate before shipping."
+    )
+
+
+def test_pickle_not_a_trust_boundary_documented() -> None:
+    """
+    Spec 145 F-3 (MAJOR, documenting test): the `__reduce__` scrub protects
+    HONEST round-trips (`copy.deepcopy`, `multiprocessing.Queue`,
+    `pickle.loads` of our own `pickle.dumps`). It is NOT a security boundary.
+
+    A hand-crafted MALICIOUS pickle stream can invoke `Order.__init__` /
+    `OrderInitialized.__init__` directly — bypassing `__reduce__` entirely and
+    therefore bypassing the scrub. This is a fundamental pickle limitation, not
+    fixable at the reducer level.
+
+    Spec 145 threat model: this is a local-only backtest feature with no
+    untrusted-pickle inputs, so the residual gap is accepted. NEVER deserialize
+    untrusted pickle containing Order/OrderInitialized.
+
+    This test documents the limitation and asserts the honest round-trip (the
+    in-scope contract) works — it is intentionally NOT a behavioral test of the
+    out-of-scope malicious-pickle path.
+    """
+    import pickle as _ser
+
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("95.00"),
+    )
+
+    # In-scope contract: honest round-trip scrubs the override.
+    restored = _ser.loads(_ser.dumps(order))
+    assert restored.fill_price_override is None, (
+        "honest pickle round-trip must scrub the override"
+    )
+
+    # Out-of-scope (documented residual gap): a malicious pickle stream that
+    # directly targets __init__ would carry the override through. We do NOT
+    # construct such a stream here — the spec 145 threat model explicitly
+    # accepts this gap (local-only backtest feature, no untrusted pickle).
+
+
+@pytest.mark.parametrize("protocol", [2, 3, 4, 5])
+def test_order_pickle_strips_across_protocols(protocol: int) -> None:
+    """
+    Spec 145 F-7 (MINOR): the `__reduce__` scrub must hold for ALL pickle
+    protocols that support `Order`. Protocols 2-5 (the range used by
+    `pickle`, `copy.deepcopy`, and `multiprocessing.Queue`) are exercised here.
+
+    Protocols 0 and 1 do NOT support `Order` at all (pre-existing upstream NT
+    constraint — `ClientOrderId` and other cdef value types are not proto-0/1
+    picklable); see `test_order_pickle_protocol_0_1_unsupported`.
+    """
+    import pickle as _ser
+
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("95.00"),
+    )
+
+    restored = _ser.loads(_ser.dumps(order, protocol=protocol))
+    assert restored.fill_price_override is None, (
+        f"pickle protocol {protocol} round-trip leaked fill_price_override "
+        f"= {restored.fill_price_override!r} — scrub must hold for all "
+        f"supported protocols."
+    )
+    assert restored.init_event.fill_price_override is None, (
+        f"nested OrderInitialized leaked override at protocol {protocol}"
+    )
+
+
+@pytest.mark.parametrize("protocol", [0, 1])
+def test_order_pickle_protocol_0_1_unsupported(protocol: int) -> None:
+    """
+    Spec 145 F-7 (MINOR): pickle protocols 0 and 1 do NOT support `Order` —
+    this is a pre-existing upstream NautilusTrader constraint (`ClientOrderId`
+    and other cdef value types are not proto-0/1 picklable), NOT a spec 145
+    regression. We assert it fails CLOSED (raises) rather than silently
+    producing a non-scrubbed object.
+    """
+    import pickle as _ser
+
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("95.00"),
+    )
+
+    with pytest.raises(Exception):  # noqa: B017,PT011 — pre-existing proto-0/1 constraint
+        _ser.dumps(order, protocol=protocol)
+
+
+def test_order_multiprocessing_queue_strips_override() -> None:
+    """
+    Spec 145 F-7 (MINOR): `multiprocessing.Queue` serializes via pickle. An
+    `Order` carrying an override pushed through a Queue must come out scrubbed
+    — confirms the `__reduce__` scrub at the threat model's process-boundary
+    vector.
+    """
+    import multiprocessing as _mp
+
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("95.00"),
+    )
+
+    queue: Any = _mp.Queue()
+    try:
+        queue.put(order)
+        restored = queue.get(timeout=5)
+    finally:
+        queue.close()
+        queue.join_thread()
+
+    assert restored.fill_price_override is None, (
+        "multiprocessing.Queue round-trip must scrub fill_price_override"
+    )
+
+
+def test_market_order_transform_drops_fill_price_override() -> None:
+    """
+    Spec 145 F-9 (MINOR) + invariant #2: `MarketOrder.transform()` produces a
+    fresh MARKET order from another order. The override is intentionally NOT
+    carried through — the override semantics belong only to the original
+    MARKET submission path. This pins that intentional drop, which was
+    previously untested.
+    """
+    from nautilus_trader.model.orders.limit import LimitOrder
+
+    limit = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        price=Price.from_str("100.00"),
+        init_id=UUID4(),
+        ts_init=0,
+    )
+
+    transformed = MarketOrder.transform_py(limit, 0)
+    assert transformed.fill_price_override is None, (
+        "MarketOrder.transform() must NOT carry a fill_price_override — the "
+        "override belongs only to the original MARKET submission path."
+    )

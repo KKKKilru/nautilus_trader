@@ -11691,3 +11691,90 @@ def test_adversarial_payload_strips_field() -> None:
         f"adversarial fill_price_override = {reconstructed.fill_price_override}. "
         f"Round-trip closure broken — external injection vector OPEN."
     )
+
+
+def test_market_fill_override_skips_liquidity_consumption_and_protection() -> None:
+    """
+    Spec 145 P1 R1-P1-2 (MAJOR, Claude): when `fill_price_override` is set, the
+    matching engine MUST fill at exactly the override price unconditionally
+    (design invariant #4). Without an exemption, the downstream filters
+    `_filter_fills_by_protection` (gated by `price_protection_points > 0`) and
+    `_apply_liquidity_consumption` (gated by `liquidity_consumption=True`)
+    would silently drop or truncate the fill because the override price is not
+    in the L1 book.
+
+    Setup:
+      - liquidity_consumption=True   → would truncate fill qty to displayed level size.
+      - price_protection_points=100  → protection = ask + 1.00 = ~106, would drop a
+                                       fill at 200.00 (BUY) since 200 > 106.
+      - override = 200.00 (way out of range)
+      - quantity = 5.0 (smaller than displayed level size 10.0 to ensure the
+                        ONLY interesting effect we're testing is the price-protection
+                        filter; without exemption the protection filter drops the
+                        entire fill, leaving 0 fills observable from msgbus).
+
+    Assert: full quantity fills at exactly 200.00, proving both filters were skipped.
+    """
+    # Arrange — engine with BOTH downstream filters enabled.
+    clock = TestClock()
+    trader_id = TestIdStubs.trader_id()
+    msgbus = MessageBus(trader_id=trader_id, clock=clock)
+    instrument = _ETHUSDT_PERP_BINANCE
+    cache = TestComponentStubs.cache()
+    cache.add_instrument(instrument)
+    account_id = TestIdStubs.account_id()
+
+    matching_engine = OrderMatchingEngine(
+        instrument=instrument,
+        raw_id=0,
+        fill_model=FillModel(),
+        fee_model=MakerTakerFeeModel(),
+        book_type=BookType.L1_MBP,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        reject_stop_orders=False,
+        bar_execution=True,
+        liquidity_consumption=True,        # would truncate fill qty
+        price_protection_points=100,       # would drop out-of-range override
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+    )
+    bar = _make_override_test_bar(instrument)  # O=100, H=110, L=90, C=105
+    matching_engine.process_bar(bar)
+
+    messages: list[Any] = []
+    msgbus.register("ExecEngine.process", messages.append)
+
+    # Override = 200.00 — way above bar.high (110) AND above protection ceiling
+    # (ask ~105 + 1.00 = ~106). Without exemption, _filter_fills_by_protection
+    # would drop this fill entirely (BUY fills require price <= protection).
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(5.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("200.00"),
+    )
+
+    # Act
+    matching_engine.process_order(order, account_id)
+
+    # Assert: exactly one fill, at the override price, full quantity.
+    fills = [m for m in messages if isinstance(m, OrderFilled)]
+    assert len(fills) == 1, (
+        f"Expected one fill (downstream filters must NOT drop override fills), "
+        f"got {[type(m).__name__ for m in messages]}"
+    )
+    assert fills[0].last_px == Price.from_str("200.00"), (
+        f"Expected fill at override 200.00 (filters must NOT mutate price), "
+        f"got {fills[0].last_px}"
+    )
+    assert fills[0].last_qty == instrument.make_qty(5.0), (
+        f"Expected full fill qty 5.0 (liquidity_consumption must NOT truncate), "
+        f"got {fills[0].last_qty}"
+    )

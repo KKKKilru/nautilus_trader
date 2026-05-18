@@ -6115,10 +6115,20 @@ cdef class OrderMatchingEngine:
         order.liquidity_side = LiquiditySide.TAKER
         cdef list[tuple[Price, Quantity]] fills = self.determine_market_fills_with_simulation(order)
 
+        # Spec 145 (R1-P1-2): when a deterministic fill-price override is set, the
+        # strategy is contract-responsible for choosing the fill price and we must
+        # fill at exactly that price unconditionally (Decision invariant #4). The
+        # override price typically does NOT exist in the L1/L2 book, so running
+        # the result through `_filter_fills_by_protection` or
+        # `_apply_liquidity_consumption` would silently drop/truncate the fill.
+        # Mirror the `is_trigger_price_fill` exemption pattern below.
+        cdef bint has_override = order.has_fill_price_override_c()
+
         # Compute protection price at fill time (trigger-time semantics for stops)
         cdef Price protection_price = None
         if (
-            self._price_protection_points > 0
+            not has_override
+            and self._price_protection_points > 0
             and (order.order_type == OrderType.MARKET or order.order_type == OrderType.STOP_MARKET)
         ):
             protection_price = self._calculate_protection_price(order.side)
@@ -6138,7 +6148,7 @@ cdef class OrderMatchingEngine:
             and order.has_trigger_price_c()
         )
 
-        if not is_trigger_price_fill:
+        if not is_trigger_price_fill and not has_override:
             fills = self._apply_liquidity_consumption(fills, order.side, order.leaves_qty._mem.raw)
 
         self.apply_fills(

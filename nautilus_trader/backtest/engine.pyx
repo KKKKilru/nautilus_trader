@@ -6158,6 +6158,13 @@ cdef class OrderMatchingEngine:
         for fill simulation. If so, it uses that for fill determination. Otherwise,
         it falls back to the standard market fill logic.
         """
+        # Spec 145: deterministic MARKET fill-price override short-circuit. When the
+        # strategy supplies `fill_price_override`, fill the order's leaves at exactly
+        # that price — no OHLC tick simulation, no FillModel, no range validation
+        # (Decision invariant #4: strategy is contract-responsible for validation).
+        if order.has_fill_price_override_c():
+            return [(order.fill_price_override, order.leaves_qty)]
+
         if self._fill_model is None:
             return self.determine_market_price_and_volume(order)
 

@@ -66,7 +66,7 @@ from nautilus_trader.model.objects cimport Quantity
 
 def _unpickle_order_scrub_override(cython_reduce_tuple):
     """
-    Spec 145 BLOCKING R1-P1-1 (Codex) — module-level unpickle helper used by
+    Spec 145 invariant #3 — module-level unpickle helper used by
     ``Order.__reduce__`` to enforce the ``_fill_price_override = None``
     invariant on every serialization round-trip (deepcopy, multiprocessing
     queue, persistence layer, etc.).
@@ -74,9 +74,8 @@ def _unpickle_order_scrub_override(cython_reduce_tuple):
     The helper accepts the tuple returned by Cython's auto-generated
     ``__reduce_cython__()`` (shape: ``(reconstructor, args, state)``),
     reconstructs the order via Cython's normal protocol, then calls the
-    ``_clear_fill_price_override`` cpdef helper which sets the field to
-    ``None``. Closes the pickle round-trip injection vector — design
-    invariant #3.
+    ``_clear_fill_price_override`` cdef helper which sets the field to
+    ``None``. Closes the pickle round-trip injection vector.
     """
     reconstructor = cython_reduce_tuple[0]
     args = cython_reduce_tuple[1]
@@ -365,37 +364,53 @@ cdef class Order:
     cpdef void set_quote_quantity(self, bint value):
         self.is_quote_quantity = value
 
-    cpdef void _clear_fill_price_override(self):
-        # Spec 145 BLOCKING R1-P1-1 (Codex): serialization-round-trip scrubber.
+    cdef void _clear_fill_price_override(self):
+        # Spec 145 invariant #3: serialization-round-trip scrubber.
         # `cdef Price _fill_price_override` is not Python-writable, so the
-        # `__reduce__` post-construction helper needs this cpdef wrapper to
-        # force the field to ``None``. Underscore prefix signals internal-use
-        # only — strategies MUST NOT call this. Backtest / live execution
-        # paths never invoke it; only the deserialization reconstructor does.
+        # `__reduce__` post-construction helper needs this cdef wrapper to
+        # force the field to ``None``. `cdef` (not `cpdef`) — the ONLY caller
+        # is the module-level `_unpickle_order_scrub_override` in this same
+        # `.pyx`; keeping it `cdef` enforces internal-only at the compiler
+        # level. Strategies MUST NOT call this; backtest / live execution
+        # paths never invoke it, only the deserialization reconstructor does.
         self._fill_price_override = None
 
     def __reduce__(self):
-        # Spec 145 BLOCKING R1-P1-1 (Codex): Cython cdef classes auto-generate
+        # Spec 145 invariant #3: Cython cdef classes auto-generate
         # serialization for ALL cdef fields including `_fill_price_override`.
         # `copy.deepcopy` and `multiprocessing.Queue` both rely on the
         # serialization protocol, so an order created with an override could
         # leak the override across these boundaries — a real injection vector
-        # for downstream consumers expecting serialization-stripped semantics
-        # (invariant #3).
+        # for downstream consumers expecting serialization-stripped semantics.
         #
-        # Override `__reduce__` to wrap Cython's auto-generated reduce tuple
-        # with a reconstructor that forces `_fill_price_override = None`
-        # after the state is restored. Tests:
-        # `test_order_pickle_strips_fill_price_override` in
+        # WHY this differs from `OrderInitialized.__reduce__`: that event
+        # routes reduce through `to_dict` / `from_dict_c` (the dict carries no
+        # override and `from_dict_c` forces `None`). `Order` CANNOT do that —
+        # it carries non-dict-serializable runtime state (FSM status, fills,
+        # commissions, venue order IDs) that `to_dict` does not capture, so it
+        # must wrap Cython's auto-generated `__reduce_cython__()` tuple with a
+        # reconstructor that forces `_fill_price_override = None` after the
+        # state is restored. `__reduce_cython__` is a Cython-internal
+        # auto-generated symbol; the `test_order_reduce_uses_scrub_reconstructor`
+        # guard test catches a future Cython upgrade that renames/reshapes it.
+        #
+        # SECURITY BOUNDARY: this scrubs HONEST round-trips (copy.deepcopy,
+        # multiprocessing.Queue, pickle.loads of our own pickle.dumps). Pickle
+        # is NOT a trust boundary — a hand-crafted malicious pickle stream can
+        # invoke `__init__` directly and bypass this scrub. NEVER deserialize
+        # untrusted pickle containing Order/OrderInitialized. Spec 145 threat
+        # model: this is a local-only backtest feature with no untrusted-pickle
+        # inputs.
+        #
+        # Tests: `test_order_pickle_strips_fill_price_override` in
         # tests/unit_tests/backtest/test_matching_engine.py.
         #
-        # Protocol caveat (R2-P1-MAJOR, Codex): pickle protocols 0 and 1 do
-        # not support `Order` (pre-existing upstream NT constraint —
-        # `ClientOrderId` and other cdef value types are not proto-0/1
-        # picklable). Protocols >= 2 (the default for `pickle`,
-        # `copy.deepcopy`, and `multiprocessing.Queue`) are fully supported.
-        # This wrapper does not change that — proto 0/1 failed before spec
-        # 145 too.
+        # Protocol caveat: pickle protocols 0 and 1 do not support `Order`
+        # (pre-existing upstream NT constraint — `ClientOrderId` and other
+        # cdef value types are not proto-0/1 picklable). Protocols >= 2 (the
+        # default for `pickle`, `copy.deepcopy`, and `multiprocessing.Queue`)
+        # are fully supported. This wrapper does not change that — proto 0/1
+        # failed before spec 145 too.
         return (
             _unpickle_order_scrub_override,
             (self.__reduce_cython__(),),
@@ -460,7 +475,7 @@ cdef class Order:
         return self._fill_price_override is not None
 
     cdef Price get_fill_price_override_c(self):
-        # Spec 145 (R1-P1-4): cdef accessor for matching-engine hot path.
+        # Spec 145: cdef accessor for matching-engine hot path.
         # Mirrors `get_triggered_price_c()` pattern — avoids Python @property
         # lookup overhead from the backtest fill loop. The Python @property
         # remains the public surface for tests + serialization.

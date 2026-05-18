@@ -63,7 +63,7 @@ from nautilus_trader.model.objects cimport Quantity
 
 def _unpickle_order_initialized_from_dict(dict state):
     """
-    Spec 145 BLOCKING R1-P1-1 (Codex) — module-level unpickle helper used by
+    Spec 145 invariant #3 — module-level unpickle helper used by
     ``OrderInitialized.__reduce__`` to enforce
     ``fill_price_override = None`` on every serialization round-trip
     (``copy.deepcopy``, ``multiprocessing.Queue``, persistence layers, etc.).
@@ -444,10 +444,10 @@ cdef class OrderInitialized(OrderEvent):
         self._client_order_id = client_order_id
 
     def __reduce__(self):
-        # Spec 145 BLOCKING R1-P1-1 (Codex): Cython auto-generated serialization
+        # Spec 145 invariant #3: Cython auto-generated serialization
         # preserves `cdef readonly Price fill_price_override` across
         # ``copy.deepcopy`` / ``multiprocessing.Queue`` / persistence layers —
-        # bypassing the 3-layer dict/Arrow/Rust exclusion (design invariant #3).
+        # bypassing the 3-layer dict/Arrow/Rust exclusion.
         #
         # Route reduce through the existing `to_dict` / `from_dict_c` path
         # which already enforces the exclusion: `to_dict_c` omits the field,
@@ -456,6 +456,15 @@ cdef class OrderInitialized(OrderEvent):
         # crossing semantics the msgspec serializer uses. See
         # `_unpickle_order_initialized_from_dict` for the rationale on why we
         # don't delegate back to Cython auto-pickle.
+        #
+        # SECURITY BOUNDARY: this scrubs HONEST round-trips (copy.deepcopy,
+        # multiprocessing.Queue, pickle.loads of our own pickle.dumps). Pickle
+        # is NOT a trust boundary — a hand-crafted malicious pickle stream can
+        # invoke `__init__` directly and bypass this scrub. NEVER deserialize
+        # untrusted pickle containing Order/OrderInitialized. Spec 145 threat
+        # model: this is a local-only backtest feature with no untrusted-pickle
+        # inputs.
+        #
         # Tests: ``test_order_initialized_serialize_strips_fill_price_override``
         # in tests/unit_tests/backtest/test_matching_engine.py.
         return (
@@ -626,7 +635,7 @@ cdef class OrderInitialized(OrderEvent):
             event_id=UUID4.from_str_c(values["event_id"]),
             ts_init=values["ts_init"],
             reconciliation=values.get("reconciliation", False),
-            # Spec 145 BLOCKING-3 (msgspec exclusion): explicitly force None on
+            # Spec 145 invariant #3 (msgspec exclusion): explicitly force None on
             # deserialization — do NOT read `fill_price_override` from `values`,
             # even if a malicious external payload includes the key. Field is a
             # local-only execution hint, never reconstructed from the wire.
@@ -665,7 +674,7 @@ cdef class OrderInitialized(OrderEvent):
             "ts_init": obj.ts_init,
             "ts_event": obj.ts_init,
             "reconciliation": obj.reconciliation,
-            # Spec 145 BLOCKING-3 (msgspec exclusion): `fill_price_override` is
+            # Spec 145 invariant #3 (msgspec exclusion): `fill_price_override` is
             # intentionally NOT serialized. It is a local-only execution hint
             # consumed by the in-process matching engine. Persisting it would
             # allow external Redis stream / WebSocket / historical-artifact

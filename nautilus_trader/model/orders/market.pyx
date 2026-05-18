@@ -201,7 +201,7 @@ cdef class MarketOrder(Order):
 
     @staticmethod
     cdef MarketOrder from_pyo3_c(pyo3_order):
-        # Spec 145 (R1-P1-6): `fill_price_override` is intentionally NOT
+        # Spec 145: `fill_price_override` is intentionally NOT
         # forwarded from the pyo3 order. The field is Cython-side-only and has
         # no Rust counterpart in NautilusTrader v1.226.0 (the Rust `Order`
         # struct does not carry it). If a future Rust-side mirror is added,
@@ -243,8 +243,8 @@ cdef class MarketOrder(Order):
         dict[str, object]
 
         """
-        # Spec 145 (R1-P1-5): `fill_price_override` is intentionally NOT
-        # serialized (design invariant #3 — see OrderInitialized.to_dict_c /
+        # Spec 145 invariant #3: `fill_price_override` is intentionally NOT
+        # serialized (see OrderInitialized.to_dict_c /
         # from_dict_c). The override is a local-only execution hint consumed
         # by the in-process backtest matching engine. Persisting it would let
         # external Redis stream / WebSocket / historical-artifact replays
@@ -359,7 +359,7 @@ cdef class MarketOrder(Order):
         """
         Condition.not_none(order, "order")
 
-        # Spec 145 (R1-P1-7): `fill_price_override` is intentionally NOT
+        # Spec 145 invariant #2: `fill_price_override` is intentionally NOT
         # carried through `transform()`. The override semantics belong only to
         # the original MARKET submission path — if a LIMIT/STOP is being
         # transformed into a MARKET (e.g. emulator promotion), the new MARKET

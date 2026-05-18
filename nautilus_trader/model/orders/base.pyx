@@ -388,6 +388,14 @@ cdef class Order:
         # after the state is restored. Tests:
         # `test_order_pickle_strips_fill_price_override` in
         # tests/unit_tests/backtest/test_matching_engine.py.
+        #
+        # Protocol caveat (R2-P1-MAJOR, Codex): pickle protocols 0 and 1 do
+        # not support `Order` (pre-existing upstream NT constraint —
+        # `ClientOrderId` and other cdef value types are not proto-0/1
+        # picklable). Protocols >= 2 (the default for `pickle`,
+        # `copy.deepcopy`, and `multiprocessing.Queue`) are fully supported.
+        # This wrapper does not change that — proto 0/1 failed before spec
+        # 145 too.
         return (
             _unpickle_order_scrub_override,
             (self.__reduce_cython__(),),

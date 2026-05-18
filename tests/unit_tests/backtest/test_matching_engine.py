@@ -11859,6 +11859,27 @@ def test_order_pickle_strips_fill_price_override() -> None:
     assert restored.quantity == order.quantity
     assert restored.side == order.side
 
+    # R2-P1 (Codex MINOR): the nested OrderInitialized in `_events[0]` must
+    # ALSO be scrubbed — pickle recursion invokes OrderInitialized.__reduce__
+    # for list contents, but the invariant deserves an explicit assertion so a
+    # future Cython list-pickling change can't silently regress it.
+    assert restored.init_event.fill_price_override is None, (
+        "nested OrderInitialized must also be scrubbed on round-trip"
+    )
+
+    # R2-P1 (Claude MINOR): copy.deepcopy uses __reduce_ex__ → __reduce__, so
+    # the scrub fires for deepcopy too. Pin it explicitly at the deepcopy
+    # integration point (the threat model's primary vector).
+    import copy as _copy
+
+    deep = _copy.deepcopy(order)
+    assert deep.fill_price_override is None, (
+        "copy.deepcopy must also scrub fill_price_override"
+    )
+    assert deep.init_event.fill_price_override is None, (
+        "copy.deepcopy must scrub the nested OrderInitialized too"
+    )
+
 
 def test_order_initialized_pickle_strips_fill_price_override() -> None:
     """

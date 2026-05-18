@@ -84,6 +84,7 @@ cdef class OrderFactory:
         dict exec_algorithm_params=*,
         list[str] tags=*,
         ClientOrderId client_order_id=*,
+        Price fill_price_override=*,
     )
 
     cpdef LimitOrder limit(

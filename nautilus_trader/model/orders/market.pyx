@@ -39,6 +39,7 @@ from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.identifiers cimport OrderListId
 from nautilus_trader.model.identifiers cimport StrategyId
 from nautilus_trader.model.identifiers cimport TraderId
+from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 from nautilus_trader.model.orders.base cimport Order
 
@@ -96,6 +97,12 @@ cdef class MarketOrder(Order):
         The execution algorithm spawning primary client order ID.
     tags : list[str], optional
         The custom user tags for the order.
+    fill_price_override : Price, optional
+        Deterministic fill-price override (spec 145). When set, the backtest
+        matching engine fills this MARKET order at exactly this price,
+        bypassing the OHLC tick simulation. NT does not range-validate the
+        override; the strategy is contract-responsible. Field is excluded from
+        serialization to prevent external replay injection.
 
     Raises
     ------
@@ -132,6 +139,7 @@ cdef class MarketOrder(Order):
         dict exec_algorithm_params = None,
         ClientOrderId exec_spawn_id = None,
         list[str] tags = None,
+        Price fill_price_override = None,
     ):
         Condition.not_equal(order_side, OrderSide.NO_ORDER_SIDE, "order_side", "NO_ORDER_SIDE")
         Condition.not_equal(time_in_force, TimeInForce.GTD, "time_in_force", "GTD")
@@ -162,6 +170,7 @@ cdef class MarketOrder(Order):
             tags=tags,
             event_id=init_id,
             ts_init=ts_init,
+            fill_price_override=fill_price_override,
         )
         super().__init__(init=init)
 
@@ -306,6 +315,7 @@ cdef class MarketOrder(Order):
             exec_algorithm_params=init.exec_algorithm_params,
             exec_spawn_id=init.exec_spawn_id,
             tags=init.tags,
+            fill_price_override=init.fill_price_override,
         )
 
     @staticmethod

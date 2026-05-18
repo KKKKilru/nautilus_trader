@@ -150,7 +150,7 @@ cdef class Order:
     cpdef dict to_dict(self)
 
     cpdef void set_quote_quantity(self, bint value)
-    cdef void _clear_fill_price_override(self)
+    cpdef void _clear_fill_price_override(self)
     cdef void set_activated_c(self, Price activation_price)
     cdef void set_triggered_price_c(self, Price triggered_price)
     cdef Price get_triggered_price_c(self)

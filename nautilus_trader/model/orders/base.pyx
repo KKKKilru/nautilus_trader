@@ -74,7 +74,7 @@ def _unpickle_order_scrub_override(cython_reduce_tuple):
     The helper accepts the tuple returned by Cython's auto-generated
     ``__reduce_cython__()`` (shape: ``(reconstructor, args, state)``),
     reconstructs the order via Cython's normal protocol, then calls the
-    ``_clear_fill_price_override`` cdef helper which sets the field to
+    ``_clear_fill_price_override`` cpdef helper which sets the field to
     ``None``. Closes the pickle round-trip injection vector.
     """
     reconstructor = cython_reduce_tuple[0]
@@ -364,15 +364,17 @@ cdef class Order:
     cpdef void set_quote_quantity(self, bint value):
         self.is_quote_quantity = value
 
-    cdef void _clear_fill_price_override(self):
+    cpdef void _clear_fill_price_override(self):
         # Spec 145 invariant #3: serialization-round-trip scrubber.
         # `cdef Price _fill_price_override` is not Python-writable, so the
-        # `__reduce__` post-construction helper needs this cdef wrapper to
-        # force the field to ``None``. `cdef` (not `cpdef`) — the ONLY caller
-        # is the module-level `_unpickle_order_scrub_override` in this same
-        # `.pyx`; keeping it `cdef` enforces internal-only at the compiler
-        # level. Strategies MUST NOT call this; backtest / live execution
-        # paths never invoke it, only the deserialization reconstructor does.
+        # `__reduce__` post-construction helper needs this wrapper to force
+        # the field to ``None``. MUST stay `cpdef` (not `cdef`): the ONLY
+        # caller is the module-level `_unpickle_order_scrub_override`, which is
+        # a Python-level `def` — a plain `cdef` method is invisible to Python
+        # callers and the unpickle helper would `AttributeError`. The leading
+        # underscore signals internal-only — strategies MUST NOT call this;
+        # backtest / live execution paths never invoke it, only the
+        # deserialization reconstructor does.
         self._fill_price_override = None
 
     def __reduce__(self):

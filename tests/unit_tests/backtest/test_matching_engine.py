@@ -11456,12 +11456,17 @@ def _make_override_test_bar(instrument) -> Bar:
     )
 
 
-def test_market_fill_at_override_price() -> None:
+@pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])
+def test_market_fill_at_override_price(side: OrderSide) -> None:
     """
-    Canonical happy-path: MARKET BUY with `fill_price_override=Price("95.00")` on a
+    Canonical happy-path: MARKET with `fill_price_override=Price("95.00")` on a
     bar with O=100/H=110/L=90/C=105 fills at exactly 95.00 (NOT bar.open / high /
     low / close). Enforces spec 145 engine short-circuit
     (`determine_market_fills_with_simulation`).
+
+    R1-P1-3 (Claude MAJOR): parametrized BUY+SELL — the short-circuit is
+    side-agnostic and any downstream filter exemption (R1-P1-2) must hold
+    symmetrically. 95.00 is in-range [90, 110] for both sides.
     """
     # Arrange
     matching_engine, msgbus, _cache, account_id, instrument = (
@@ -11478,7 +11483,7 @@ def test_market_fill_at_override_price() -> None:
         strategy_id=TestIdStubs.strategy_id(),
         instrument_id=instrument.id,
         client_order_id=TestIdStubs.client_order_id(),
-        order_side=OrderSide.BUY,
+        order_side=side,
         quantity=instrument.make_qty(1.0),
         init_id=UUID4(),
         ts_init=0,
@@ -11491,25 +11496,32 @@ def test_market_fill_at_override_price() -> None:
     # Assert: exactly one fill, at the override price (NOT 100/110/90/105).
     fills = [m for m in messages if isinstance(m, OrderFilled)]
     assert len(fills) == 1, (
-        f"Expected one fill, got {[type(m).__name__ for m in messages]}"
+        f"Expected one fill ({side.name}), got "
+        f"{[type(m).__name__ for m in messages]}"
     )
     assert fills[0].last_px == Price.from_str("95.00"), (
-        f"Expected fill at override 95.00, got {fills[0].last_px}"
+        f"Expected fill at override 95.00 ({side.name}), got {fills[0].last_px}"
     )
 
 
-def test_market_no_override_uses_stock_fill() -> None:
+@pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])
+def test_market_no_override_uses_stock_fill(side: OrderSide) -> None:
     """
     Regression test: with NO `fill_price_override`, the engine MUST fall through
     to the stock OHLC-tick fill path. The exact stock fill price for a MARKET
-    BUY submitted AFTER a closed bar with O=100/H=110/L=90/C=105 follows the
-    L1_MBP ask state left by the bar's last tick (close=105.00) — this mirrors
+    submitted AFTER a closed bar with O=100/H=110/L=90/C=105 follows the
+    L1_MBP bid/ask state left by the bar's last tick (close=105.00) — this mirrors
     the existing `test_bar_execution_bumps_trade_id_counter_per_tick`
-    pattern (bar O/H/L/C all 1000.00 → fill at 1000.00).
+    pattern (bar O/H/L/C all 1000.00 → fill at 1000.00). Both bid and ask are
+    initialized to bar.close after `process_bar`, so BUY and SELL both fill at 105.
 
     The critical contract is `last_px != 95.00` AND fill price is within bar
     range (90..110); we additionally pin to bar.close to detect regressions in
     stock behavior.
+
+    R1-P1-3 (Claude MAJOR): parametrized BUY+SELL — the no-override fall-through
+    must NOT introduce a side-specific bug. If a future side branch is added
+    around the short-circuit, this catches asymmetric breakage.
     """
     # Arrange
     matching_engine, msgbus, _cache, account_id, instrument = (
@@ -11526,7 +11538,7 @@ def test_market_no_override_uses_stock_fill() -> None:
         strategy_id=TestIdStubs.strategy_id(),
         instrument_id=instrument.id,
         client_order_id=TestIdStubs.client_order_id(),
-        order_side=OrderSide.BUY,
+        order_side=side,
         quantity=instrument.make_qty(1.0),
         init_id=UUID4(),
         ts_init=0,
@@ -11539,27 +11551,41 @@ def test_market_no_override_uses_stock_fill() -> None:
     # Assert
     fills = [m for m in messages if isinstance(m, OrderFilled)]
     assert len(fills) == 1, (
-        f"Expected one fill, got {[type(m).__name__ for m in messages]}"
+        f"Expected one fill ({side.name}), got "
+        f"{[type(m).__name__ for m in messages]}"
     )
     last_px = fills[0].last_px
     # Stock behavior: fill at last tick of the bar (close) for L1_MBP bar exec.
     assert last_px == Price.from_str("105.00"), (
-        f"Stock-fill regression: expected bar.close=105.00, got {last_px}. "
-        f"The override short-circuit must NOT fire when fill_price_override is None."
+        f"Stock-fill regression ({side.name}): expected bar.close=105.00, "
+        f"got {last_px}. The override short-circuit must NOT fire when "
+        f"fill_price_override is None."
     )
     # Defensive: the override sentinel value 95.00 must NEVER appear in this path.
     assert last_px != Price.from_str("95.00")
 
 
-def test_market_fills_at_out_of_range_override() -> None:
+@pytest.mark.parametrize(
+    "side,override_px",
+    [
+        (OrderSide.BUY, "200.00"),   # WAY above bar.high=110
+        (OrderSide.SELL, "50.00"),   # WAY below bar.low=90
+    ],
+)
+def test_market_fills_at_out_of_range_override(side: OrderSide, override_px: str) -> None:
     """
     Documents NT no-validate behavior per spec 145 design invariant #4 — the
     backtest engine fills at `fill_price_override` even when it sits WAY outside
-    the bar's OHLC range (e.g. 200.00 vs bar high 110.00). The strategy layer is
-    contract-responsible for range validation in P2 (`_execute_with_fill_price_override`
-    + planner pre-flight). Do NOT take this test as a recommendation to ship
-    out-of-range overrides — it pins the engine's permissive contract so future
-    accidental range-check additions surface as test failures.
+    the bar's OHLC range. The strategy layer is contract-responsible for range
+    validation in P2 (`_execute_with_fill_price_override` + planner pre-flight).
+    Do NOT take this test as a recommendation to ship out-of-range overrides —
+    it pins the engine's permissive contract so future accidental range-check
+    additions surface as test failures.
+
+    R1-P1-3 (Claude MAJOR): parametrized BUY/SELL with directional out-of-range
+    overrides (BUY=200 above high, SELL=50 below low). The engine must fill at
+    exactly the override regardless of side — confirms the short-circuit AND
+    the R1-P1-2 filter exemption are both side-agnostic.
     """
     # Arrange
     matching_engine, msgbus, _cache, account_id, instrument = (
@@ -11576,11 +11602,11 @@ def test_market_fills_at_out_of_range_override() -> None:
         strategy_id=TestIdStubs.strategy_id(),
         instrument_id=instrument.id,
         client_order_id=TestIdStubs.client_order_id(),
-        order_side=OrderSide.BUY,
+        order_side=side,
         quantity=instrument.make_qty(1.0),
         init_id=UUID4(),
         ts_init=0,
-        fill_price_override=Price.from_str("200.00"),  # WAY outside [90, 110]
+        fill_price_override=Price.from_str(override_px),
     )
 
     # Act
@@ -11589,11 +11615,12 @@ def test_market_fills_at_out_of_range_override() -> None:
     # Assert: engine fills at the override unconditionally (no range check).
     fills = [m for m in messages if isinstance(m, OrderFilled)]
     assert len(fills) == 1, (
-        f"Expected one fill, got {[type(m).__name__ for m in messages]}"
+        f"Expected one fill ({side.name}, override={override_px}), got "
+        f"{[type(m).__name__ for m in messages]}"
     )
-    assert fills[0].last_px == Price.from_str("200.00"), (
-        f"Expected fill at out-of-range override 200.00 (no range validation), "
-        f"got {fills[0].last_px}"
+    assert fills[0].last_px == Price.from_str(override_px), (
+        f"Expected fill at out-of-range override {override_px} "
+        f"({side.name}, no range validation), got {fills[0].last_px}"
     )
 
 

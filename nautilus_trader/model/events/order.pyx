@@ -61,6 +61,30 @@ from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 
 
+def _unpickle_order_initialized_scrub_override(cython_reduce_tuple):
+    """
+    Spec 145 BLOCKING R1-P1-1 (Codex) — module-level unpickle helper used by
+    ``OrderInitialized.__reduce__`` to enforce
+    ``fill_price_override = None`` on every serialization round-trip
+    (deepcopy, multiprocessing queue, persistence layer, etc.).
+
+    The helper accepts the tuple returned by Cython's auto-generated
+    ``__reduce_cython__()`` (shape: ``(reconstructor, args, state)``),
+    reconstructs the event via Cython's normal protocol, then calls the
+    ``_clear_fill_price_override`` cpdef helper which sets the field to
+    ``None``. Closes the serialization round-trip injection vector — design
+    invariant #3.
+    """
+    reconstructor = cython_reduce_tuple[0]
+    args = cython_reduce_tuple[1]
+    state = cython_reduce_tuple[2] if len(cython_reduce_tuple) > 2 else None
+    obj = reconstructor(*args)
+    if state is not None:
+        obj.__setstate_cython__(state)
+    obj._clear_fill_price_override()
+    return obj
+
+
 cdef class OrderEvent(Event):
     """
     The abstract base class for all order events.
@@ -409,6 +433,28 @@ cdef class OrderInitialized(OrderEvent):
 
     def set_client_order_id(self, ClientOrderId client_order_id):
         self._client_order_id = client_order_id
+
+    cpdef void _clear_fill_price_override(self):
+        # Spec 145 BLOCKING R1-P1-1 (Codex): serialization-round-trip scrubber.
+        # `cdef readonly Price fill_price_override` is not Python-writable, so
+        # the `__reduce__` post-construction helper needs this cpdef wrapper.
+        # Underscore prefix signals internal-use only — external callers MUST
+        # NOT invoke it. Backtest / live execution paths never call it; only
+        # the deserialization reconstructor does.
+        self.fill_price_override = None
+
+    def __reduce__(self):
+        # Spec 145 BLOCKING R1-P1-1 (Codex): Cython auto-generated serialization
+        # preserves `fill_price_override` across ``copy.deepcopy`` /
+        # ``multiprocessing.Queue`` / persistence layers — bypassing the
+        # 3-layer dict/Arrow/Rust exclusion (design invariant #3).
+        # Override to wrap Cython's auto-reduce with a scrubbing reconstructor.
+        # Tests: ``test_order_initialized_serialize_strips_fill_price_override``
+        # in tests/unit_tests/backtest/test_matching_engine.py.
+        return (
+            _unpickle_order_initialized_scrub_override,
+            (self.__reduce_cython__(),),
+        )
 
     @property
     def trader_id(self) -> TraderId:

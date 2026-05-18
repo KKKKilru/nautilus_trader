@@ -11805,3 +11805,103 @@ def test_market_fill_override_skips_liquidity_consumption_and_protection() -> No
         f"Expected full fill qty 5.0 (liquidity_consumption must NOT truncate), "
         f"got {fills[0].last_qty}"
     )
+
+
+def test_order_pickle_strips_fill_price_override() -> None:
+    """
+    Spec 145 BLOCKING R1-P1-1 (Codex): Cython cdef classes auto-generate
+    serialization for ALL cdef fields including `_fill_price_override` on
+    `Order` base. `copy.deepcopy` and `multiprocessing.Queue` both rely on
+    the serialization protocol, so the field would leak across these
+    boundaries without an explicit scrub.
+
+    Tests `Order.__reduce__` enforces `_fill_price_override = None` on the
+    deserialized object — closes the round-trip injection vector for design
+    invariant #3.
+    """
+    import pickle as _ser  # serialization round-trip module
+
+    # Arrange — MarketOrder with override set.
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("95.00"),
+    )
+
+    # Sanity: original carries the override.
+    assert order.fill_price_override == Price.from_str("95.00")
+
+    # Act — round-trip (same protocol used by copy.deepcopy +
+    # multiprocessing.Queue).
+    restored: MarketOrder = _ser.loads(_ser.dumps(order))
+
+    # Assert — order rebuilds with all other state intact but the override is
+    # forced to None.
+    assert restored.fill_price_override is None, (
+        f"Spec 145 BLOCKING R1-P1-1 violated: serialization round-trip "
+        f"preserved `fill_price_override` = {restored.fill_price_override!r}. "
+        f"copy.deepcopy / multiprocessing.Queue would carry the override "
+        f"across process / debug boundaries (invariant #3 violated)."
+    )
+    assert restored.has_fill_price_override is False, (
+        f"`has_fill_price_override` should reflect scrubbed state, "
+        f"got {restored.has_fill_price_override}"
+    )
+    # Defensive: other fields survive round-trip (sanity check on the
+    # reconstruction wrapper).
+    assert restored.client_order_id == order.client_order_id
+    assert restored.quantity == order.quantity
+    assert restored.side == order.side
+
+
+def test_order_initialized_pickle_strips_fill_price_override() -> None:
+    """
+    Spec 145 BLOCKING R1-P1-1 (Codex): event-level analog of
+    `test_order_pickle_strips_fill_price_override`. Cython auto-generated
+    serialization preserves `cdef readonly Price fill_price_override` on
+    `OrderInitialized`, bypassing the 3-layer dict/Arrow/Rust exclusion.
+
+    `OrderInitialized.__reduce__` must force `fill_price_override = None`
+    on the deserialized event — closes the round-trip injection vector.
+    """
+    import pickle as _ser  # serialization round-trip module
+
+    # Arrange — MarketOrder so we get an OrderInitialized with the override.
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=_ETHUSDT_PERP_BINANCE.id,
+        client_order_id=TestIdStubs.client_order_id(),
+        order_side=OrderSide.BUY,
+        quantity=_ETHUSDT_PERP_BINANCE.make_qty(1.0),
+        init_id=UUID4(),
+        ts_init=0,
+        fill_price_override=Price.from_str("95.00"),
+    )
+    init_event = order.init_event
+
+    # Sanity: original event carries the override.
+    assert init_event.fill_price_override == Price.from_str("95.00")
+
+    # Act — round-trip the event.
+    restored: OrderInitialized = _ser.loads(_ser.dumps(init_event))
+
+    # Assert — event reconstructs with override scrubbed.
+    assert restored.fill_price_override is None, (
+        f"Spec 145 BLOCKING R1-P1-1 violated at event level: serialization "
+        f"round-trip preserved `OrderInitialized.fill_price_override` = "
+        f"{restored.fill_price_override!r}. "
+        f"3-layer dict/Arrow/Rust exclusion bypassed via serialization."
+    )
+    # Defensive: identity-defining fields survive (proves the reconstruction
+    # wrapper itself works — we scrubbed only the target field).
+    assert restored.client_order_id == init_event.client_order_id
+    assert restored.id == init_event.id
+    assert restored.side == init_event.side
+    assert restored.quantity == init_event.quantity

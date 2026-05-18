@@ -98,6 +98,8 @@ cdef class OrderInitialized(OrderEvent):
     cdef readonly Price fill_price_override
     """The deterministic fill-price override (spec 145).\n\n:returns: `Price` or ``None``"""
 
+    cpdef void _clear_fill_price_override(self)
+
     @staticmethod
     cdef OrderInitialized from_dict_c(dict values)
 

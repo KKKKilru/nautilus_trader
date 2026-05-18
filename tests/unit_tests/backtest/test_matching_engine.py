@@ -11973,7 +11973,16 @@ def _make_order_initialized(
 
 @pytest.mark.parametrize(
     "order_type",
-    [OrderType.LIMIT, OrderType.STOP_MARKET, OrderType.MARKET_IF_TOUCHED],
+    [
+        OrderType.LIMIT,
+        OrderType.STOP_MARKET,
+        OrderType.MARKET_IF_TOUCHED,
+        # TRAILING_STOP_MARKET is BJ's primary exit-order type — explicitly
+        # covered so a regression on the most operationally-relevant
+        # non-MARKET type fails loudly. MARKET_TO_LIMIT rounds out the set.
+        OrderType.TRAILING_STOP_MARKET,
+        OrderType.MARKET_TO_LIMIT,
+    ],
 )
 def test_order_initialized_rejects_override_on_non_market(order_type: OrderType) -> None:
     """
